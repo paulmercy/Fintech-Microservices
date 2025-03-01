@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opa
+  namespace: fintech-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: opa
+  template:
+    metadata:
+      labels:
+        app: opa
+    spec:
+      containers:
+      - name: opa
+        image: openpolicyagent/opa:latest
+        ports:
+        - containerPort: 8181
+        args:
+        - "run"
+        - "--server"
+        - "--addr=:8181"
+        - "/policies"
+        volumeMounts:
+        - readOnly: true
+          mountPath: /policies
+          name: opa-policies
+      volumes:
+      - name: opa-policies
+        configMap:
+          name: opa-policies
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opa-policies
+  namespace: fintech-app
+data:
+  fintech_policies.rego: |
+    package fintech
+
+    # Default deny
+    default allow = false
+
+    # Allow user to access their own data
+    allow {
+        input.method == "GET"
+        input.path = ["users", user_id]
+        input.user.id == to_number(user_id)
+    }
+
+    # Allow user to view their own transactions
+    allow {
+        input.method == "GET"
+        input.path = ["transactions", "user", user_id]
+        input.user.id == to_number(user_id)
+    }
+
+    # Allow authenticated users to create transactions for themselves
+    allow {
+        input.method == "POST"
+        input.path = ["transactions"]
+        input.body.user_id == input.user.id
+    }
+
+    # Admin can access all endpoints
+    allow {
+        input.user.role == "admin"
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opa
+  namespace: fintech-app
+spec:
+  selector:
+    app: opa
+  ports:
+  - port: 8181
+    targetPort: 8181

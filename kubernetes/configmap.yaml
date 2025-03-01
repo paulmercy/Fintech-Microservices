@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fintech-config
+  namespace: fintech-app
+data:
+  DB_HOST: "yugabytedb"
+  DB_PORT: "5433"
+  DB_NAME: "fintech"
+  USER_SERVICE_URL: "http://user-service:8000"

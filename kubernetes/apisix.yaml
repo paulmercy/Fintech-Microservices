@@ -1,0 +1,49 @@
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: fintech-routes
+  namespace: fintech-app
+spec:
+  http:
+  - name: user-route
+    match:
+      hosts:
+      - fintech.example.com
+      paths:
+      - /api/users/*
+    backends:
+    - serviceName: user-service
+      servicePort: 8000
+      weight: 100
+    plugins:
+    - name: proxy-rewrite
+      enable: true
+      config:
+        regex_uri: ["^/api/users/(.*)", "/users/$1"]
+    - name: cors
+      enable: true
+    - name: opa
+      enable: true
+      config:
+        host: "http://opa:8181/v1/data/fintech/allow"
+  - name: transaction-route
+    match:
+      hosts:
+      - fintech.example.com
+      paths:
+      - /api/transactions/*
+    backends:
+    - serviceName: transaction-service
+      servicePort: 8000
+      weight: 100
+    plugins:
+    - name: proxy-rewrite
+      enable: true
+      config:
+        regex_uri: ["^/api/transactions/(.*)", "/transactions/$1"]
+    - name: cors
+      enable: true
+    - name: opa
+      enable: true
+      config:
+        host: "http://opa:8181/v1/data/fintech/allow"

@@ -1,0 +1,63 @@
+# kubernetes/yugabytedb.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: yugabytedb
+  namespace: fintech-app
+spec:
+  serviceName: yugabytedb
+  replicas: 1
+  selector:
+    matchLabels:
+      app: yugabytedb
+  template:
+    metadata:
+      labels:
+        app: yugabytedb
+    spec:
+      containers:
+      - name: yugabytedb
+        image: yugabytedb/yugabyte:latest
+        ports:
+        - containerPort: 5433
+          name: ysql
+        - containerPort: 9000
+          name: master-ui
+        command:
+        - "/home/yugabyte/bin/yugabyted"
+        - "start"
+        - "--daemon=false"
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "0.5"
+          limits:
+            memory: "2Gi"
+            cpu: "1"
+        volumeMounts:
+        - name: yugabyte-data
+          mountPath: /home/yugabyte/data
+  volumeClaimTemplates:
+  - metadata:
+      name: yugabyte-data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: yugabytedb
+  namespace: fintech-app
+spec:
+  selector:
+    app: yugabytedb
+  ports:
+  - port: 5433
+    targetPort: 5433
+    name: ysql
+  - port: 9000
+    targetPort: 9000
+    name: master-ui

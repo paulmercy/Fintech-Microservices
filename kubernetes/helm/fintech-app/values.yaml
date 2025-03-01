@@ -1,0 +1,68 @@
+namespace: fintech-app
+
+userService:
+  name: user-service
+  replicas: 2
+  image:
+    repository: fintech/user-service
+    tag: latest
+  service:
+    port: 8000
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+transactionService:
+  name: transaction-service
+  replicas: 2
+  image:
+    repository: fintech/transaction-service
+    tag: latest
+  service:
+    port: 8000
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+yugabyteDB:
+  name: yugabytedb
+  image:
+    repository: yugabytedb/yugabyte
+    tag: latest
+  service:
+    port: 5433
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 1
+      memory: 2Gi
+  storage:
+    size: 10Gi
+
+opa:
+  name: opa
+  image:
+    repository: openpolicyagent/opa
+    tag: latest
+  service:
+    port: 8181
+
+apisix:
+  name: apisix
+  image:
+    repository: apache/apisix
+    tag: latest
+  service:
+    http: 9080
+    https: 9443
+  replicas: 2
