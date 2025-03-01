@@ -1,11 +1,11 @@
 from fastapi import FastAPI, HTTPException, Depends, Header
 import uvicorn
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 import os
 import logging
 from sqlalchemy import create_engine, Column, Integer, String, Float, MetaData, Table
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, Session
 import requests
 
 app = FastAPI(title="User Account Service")
@@ -45,6 +45,24 @@ class UserCreate(BaseModel):
     email: str
     initial_balance: float = 0.0
 
+    @validator("username")
+    def username_must_be_alphanumeric(cls, username):
+        if not username.isalnum():
+            raise ValueError("Username must be alphanumeric")
+        return username
+
+    @validator("email")
+    def email_must_contain_at(cls, email):
+        if "@" not in email:
+            raise ValueError("Email must contain @")
+        return email
+
+    @validator("initial_balance")
+    def initial_balance_must_be_positive(cls, initial_balance):
+        if initial_balance < 0:
+            raise ValueError("Initial balance must be positive")
+        return initial_balance
+
 class UserResponse(BaseModel):
     id: int
     username: str
@@ -71,10 +89,9 @@ def health_check():
     return {"status": "healthy"}
 
 @app.post("/users/", response_model=UserResponse)
-def create_user(user: UserCreate, db: SessionLocal = Depends(get_db)):
-    db_user = User(username=user.username, email=user.email, balance=user.initial_balance)
-    
+def create_user(user: UserCreate, db: Session = Depends(get_db)):
     try:
+        db_user = User(username=user.username, email=user.email, balance=user.initial_balance)
         db.add(db_user)
         db.commit()
         db.refresh(db_user)
@@ -86,17 +103,20 @@ def create_user(user: UserCreate, db: SessionLocal = Depends(get_db)):
         raise HTTPException(status_code=400, detail=f"Error creating user: {str(e)}")
 
 @app.get("/users/{user_id}", response_model=UserResponse)
-def get_user(user_id: int, db: SessionLocal = Depends(get_db)):
+def get_user(user_id: int, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == user_id).first()
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     return user
 
 @app.put("/users/{user_id}/balance", response_model=UserResponse)
-def update_balance(user_id: int, balance_update: BalanceUpdate, db: SessionLocal = Depends(get_db)):
+def update_balance(user_id: int, balance_update: BalanceUpdate, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == user_id).first()
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
+    
+    if user.balance + balance_update.amount < 0:
+        raise HTTPException(status_code=400, detail="Insufficient balance")
     
     user.balance += balance_update.amount
     db.commit()
