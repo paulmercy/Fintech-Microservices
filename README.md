@@ -2,9 +2,10 @@
 
 This project implements a set of microservices for a Fintech application, including user account management, transaction processing, and potentially other financial services. The application is designed to be deployed on Kubernetes using Docker containers and orchestrated with Helm.
 
-## Architecture Diagram
-<iframe src="https://raw.githubusercontent.com/paulmercy/Fintech-Microservices/main/architecture/architecture.md" width="100%" height="700"></iframe>
+## System Architecture Diagram
+<object type="image/svg+xml" data="architecture/architecture-diagram.svg" style="width: 100%; max-width: 800px"></object>
 
+## Architecture
 The application consists of the following microservices:
 
 -   **User Service:** Manages user accounts, including creation, retrieval, and balance updates.
