@@ -8,8 +8,40 @@ from datetime import datetime
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, MetaData, Table
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
+from opentelemetry import trace
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from prometheus_client import Counter, Histogram
+from circuitbreaker import circuit
+import time
+from redis import Redis
+from rq import Queue
+import json
 
-app = FastAPI(title="Transaction Service")
+# Initialize OpenTelemetry
+trace.set_tracer_provider(TracerProvider())
+tracer = trace.get_tracer(__name__)
+otlp_exporter = OTLPSpanExporter(endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317"))
+span_processor = BatchSpanProcessor(otlp_exporter)
+trace.get_tracer_provider().add_span_processor(span_processor)
+
+# Initialize Redis and RQ
+redis_conn = Redis(host=os.getenv("REDIS_HOST", "redis"), port=6379)
+transaction_queue = Queue('transactions', connection=redis_conn)
+
+# Initialize Prometheus metrics
+REQUEST_COUNT = Counter('transaction_service_requests_total', 'Total requests to transaction service', ['endpoint', 'method', 'status'])
+REQUEST_LATENCY = Histogram('transaction_service_request_latency_seconds', 'Request latency in seconds', ['endpoint'])
+TRANSACTION_COUNT = Counter('transactions_total', 'Total number of transactions', ['type', 'status'])
+
+app = FastAPI(title="Transaction Service",
+             description="Transaction management service for fintech application",
+             version="1.0.0",
+             docs_url="/docs",
+             redoc_url="/redoc")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -88,54 +120,93 @@ def read_root():
 def health_check():
     return {"status": "healthy"}
 
+# Circuit breaker configuration
+@circuit(failure_threshold=5, recovery_timeout=60)
+def update_user_balance(user_id: int, amount: float):
+    response = requests.put(
+        f"{USER_SERVICE_URL}/users/{user_id}/balance",
+        json={"amount": amount}
+    )
+    if response.status_code >= 500:
+        raise HTTPException(status_code=response.status_code, detail="User service error")
+    return response
+
+# Background job for processing transactions
+def process_transaction(transaction_data: dict):
+    with tracer.start_as_current_span("process_transaction") as span:
+        span.set_attribute("transaction.id", transaction_data["id"])
+        span.set_attribute("transaction.type", transaction_data["transaction_type"])
+        
+        try:
+            # Update user balance
+            amount = transaction_data["amount"]
+            if transaction_data["transaction_type"] == "withdrawal":
+                amount = -amount
+                
+            response = update_user_balance(transaction_data["user_id"], amount)
+            
+            if response.status_code == 200:
+                TRANSACTION_COUNT.labels(type=transaction_data["transaction_type"], status="success").inc()
+            else:
+                TRANSACTION_COUNT.labels(type=transaction_data["transaction_type"], status="failed").inc()
+                
+            return response.json()
+        except Exception as e:
+            TRANSACTION_COUNT.labels(type=transaction_data["transaction_type"], status="failed").inc()
+            raise
+
+@app.middleware("http")
+async def add_metrics(request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    REQUEST_COUNT.labels(endpoint=request.url.path, method=request.method, status=response.status_code).inc()
+    REQUEST_LATENCY.labels(endpoint=request.url.path).observe(time.time() - start_time)
+    return response
+
 @app.post("/transactions/", response_model=TransactionResponse)
 def create_transaction(transaction: TransactionCreate, db: Session = Depends(get_db)):
-    # Create transaction record
-    db_transaction = Transaction(
-        user_id=transaction.user_id,
-        amount=transaction.amount,
-        transaction_type=transaction.transaction_type,
-        description=transaction.description
-    )
-    
-    try:
-        # Update user balance
-        amount = transaction.amount
-        if transaction.transaction_type == "withdrawal":
-            amount = -amount
-            
-        response = requests.put(
-            f"{USER_SERVICE_URL}/users/{transaction.user_id}/balance",
-            json={"amount": amount}
+    with tracer.start_as_current_span("create_transaction") as span:
+        span.set_attribute("transaction.type", transaction.transaction_type)
+        span.set_attribute("transaction.amount", transaction.amount)
+        
+        # Create transaction record
+        db_transaction = Transaction(
+            user_id=transaction.user_id,
+            amount=transaction.amount,
+            transaction_type=transaction.transaction_type,
+            description=transaction.description
         )
         
-        if response.status_code == 404:
-            raise HTTPException(status_code=404, detail="User not found")
-        elif response.status_code == 400:
-            raise HTTPException(status_code=400, detail="Insufficient balance")
-        elif response.status_code != 200:
-            raise HTTPException(status_code=500, detail="Failed to update user balance")
-        
-        # Save transaction
-        db.add(db_transaction)
-        db.commit()
-        db.refresh(db_transaction)
-        
-        logger.info(f"Created transaction with ID: {db_transaction.id}")
-        return db_transaction
-    except requests.RequestException as e:
-        logger.error(f"Error communicating with user service: {str(e)}")
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error communicating with user service: {str(e)}")
-    except Exception as e:
-        logger.error(f"Error creating transaction: {str(e)}")
-        db.rollback()
-        raise HTTPException(status_code=400, detail=f"Error creating transaction: {str(e)}")
+        try:
+            # Save transaction first
+            db.add(db_transaction)
+            db.commit()
+            db.refresh(db_transaction)
+            
+            # Queue the balance update
+            transaction_data = {
+                "id": db_transaction.id,
+                "user_id": transaction.user_id,
+                "amount": transaction.amount,
+                "transaction_type": transaction.transaction_type
+            }
+            transaction_queue.enqueue(process_transaction, transaction_data)
+            
+            logger.info(f"Created transaction with ID: {db_transaction.id}")
+            return db_transaction
+        except Exception as e:
+            logger.error(f"Error creating transaction: {str(e)}")
+            db.rollback()
+            raise HTTPException(status_code=400, detail=f"Error creating transaction: {str(e)}")
 
 @app.get("/transactions/user/{user_id}")
 def get_user_transactions(user_id: int, db: Session = Depends(get_db)):
     transactions = db.query(Transaction).filter(Transaction.user_id == user_id).all()
     return transactions
+
+# Initialize OpenTelemetry instrumentation
+FastAPIInstrumentor.instrument_app(app)
+SQLAlchemyInstrumentor().instrument(engine=engine)
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)

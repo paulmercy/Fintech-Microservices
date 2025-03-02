@@ -7,8 +7,32 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, MetaData, 
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 import requests
+from opentelemetry import trace
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from prometheus_client import Counter, Histogram
+from circuitbreaker import circuit
+import time
 
-app = FastAPI(title="User Account Service")
+# Initialize OpenTelemetry
+trace.set_tracer_provider(TracerProvider())
+tracer = trace.get_tracer(__name__)
+otlp_exporter = OTLPSpanExporter(endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317"))
+span_processor = BatchSpanProcessor(otlp_exporter)
+trace.get_tracer_provider().add_span_processor(span_processor)
+
+# Initialize Prometheus metrics
+REQUEST_COUNT = Counter('user_service_requests_total', 'Total requests to user service', ['endpoint', 'method', 'status'])
+REQUEST_LATENCY = Histogram('user_service_request_latency_seconds', 'Request latency in seconds', ['endpoint'])
+
+app = FastAPI(title="User Account Service", 
+             description="User account management service for fintech application",
+             version="1.0.0",
+             docs_url="/docs",
+             redoc_url="/redoc")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -123,6 +147,26 @@ def update_balance(user_id: int, balance_update: BalanceUpdate, db: Session = De
     db.refresh(user)
     logger.info(f"Updated balance for user {user_id}: new balance = {user.balance}")
     return user
+
+# Circuit breaker configuration
+@circuit(failure_threshold=5, recovery_timeout=60)
+def update_external_service(url: str, json_data: dict):
+    response = requests.put(url, json=json_data)
+    if response.status_code >= 500:
+        raise HTTPException(status_code=response.status_code, detail="External service error")
+    return response
+
+@app.middleware("http")
+async def add_metrics(request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    REQUEST_COUNT.labels(endpoint=request.url.path, method=request.method, status=response.status_code).inc()
+    REQUEST_LATENCY.labels(endpoint=request.url.path).observe(time.time() - start_time)
+    return response
+
+# Initialize OpenTelemetry instrumentation
+FastAPIInstrumentor.instrument_app(app)
+SQLAlchemyInstrumentor().instrument(engine=engine)
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)

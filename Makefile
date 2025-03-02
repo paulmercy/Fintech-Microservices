@@ -28,27 +28,27 @@ install-dependencies: ## Install all required dependencies
 	@pip install -r user-service/requirements.txt
 	@pip install -r transaction-service/requirements.txt
 	
-	@echo "$(GREEN)Installing kubectl...$(NC)"
-	@if ! command -v kubectl &> /dev/null; then \
-		curl -LO "https://dl.k8s.io/release/$(shell curl -L -s https://dl.k8s.io/release/stable.txt)/bin/$(shell uname -s | tr '[:upper:]' '[:lower:]')/$(shell uname -m)/kubectl"; \
-		chmod +x kubectl; \
-		sudo mv kubectl /usr/local/bin/; \
-	fi
+	# @echo "$(GREEN)Installing kubectl...$(NC)"
+	# @if ! command -v kubectl &> /dev/null; then \
+	# 	curl -LO "https://dl.k8s.io/release/$(shell curl -L -s https://dl.k8s.io/release/stable.txt)/bin/$(shell uname -s | tr '[:upper:]' '[:lower:]')/$(shell uname -m)/kubectl"; \
+	# 	chmod +x kubectl; \
+	# 	sudo mv kubectl /usr/local/bin/; \
+	# fi
 	
-	@echo "$(GREEN)Installing Helm...$(NC)"
-	@if ! command -v helm &> /dev/null; then \
-		curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3; \
-		chmod +x get_helm.sh; \
-		./get_helm.sh; \
-		rm get_helm.sh; \
-	fi
+	# @echo "$(GREEN)Installing Helm...$(NC)"
+	# @if ! command -v helm &> /dev/null; then \
+	# 	curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3; \
+	# 	chmod +x get_helm.sh; \
+	# 	./get_helm.sh; \
+	# 	rm get_helm.sh; \
+	# fi
 	
-	@echo "$(GREEN)Installing Minikube (for local development)...$(NC)"
-	@if ! command -v minikube &> /dev/null; then \
-		curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-$(shell uname -s | tr '[:upper:]' '[:lower:]')-$(shell uname -m); \
-		sudo install minikube-$(shell uname -s | tr '[:upper:]' '[:lower:]')-$(shell uname -m) /usr/local/bin/minikube; \
-		rm minikube-$(shell uname -s | tr '[:upper:]' '[:lower:]')-$(shell uname -m); \
-	fi
+	# @echo "$(GREEN)Installing Minikube (for local development)...$(NC)"
+	# @if ! command -v minikube &> /dev/null; then \
+	# 	curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-$(shell uname -s | tr '[:upper:]' '[:lower:]')-$(shell uname -m); \
+	# 	sudo install minikube-$(shell uname -s | tr '[:upper:]' '[:lower:]')-$(shell uname -m) /usr/local/bin/minikube; \
+	# 	rm minikube-$(shell uname -s | tr '[:upper:]' '[:lower:]')-$(shell uname -m); \
+	# fi
 	
 	@echo "$(GREEN)All dependencies installed!$(NC)"
 
@@ -94,15 +94,69 @@ create-namespace: ## Create Kubernetes namespace
 
 .PHONY: install-operators
 install-operators: ## Install required Kubernetes operators
-	@echo "$(GREEN)Installing KEDA operator...$(NC)"
-	@$(HELM) repo add kedacore https://kedacore.github.io/charts
-	@$(HELM) repo update
-	@$(HELM) install keda kedacore/keda --namespace keda --create-namespace
+	@echo "$(GREEN)Cleaning up any existing KEDA installation...$(NC)"
+	@-$(HELM) uninstall keda --namespace keda 2>/dev/null || true
+	@-$(KUBECTL) delete namespace keda --wait=false 2>/dev/null || true
+	@sleep 15  # Increased cleanup wait time
 	
-	@echo "$(GREEN)Installing APISIX operator...$(NC)"
+	@echo "$(GREEN)Installing KEDA operator...$(NC)"
+	@$(HELM) repo add kedacore https://kedacore.github.io/charts --force-update
+	@$(HELM) repo update
+	
+	@echo "$(GREEN)Installing KEDA with CRDs...$(NC)"
+	@$(HELM) install keda kedacore/keda \
+		--version 2.0.0 \
+		--namespace keda \
+		--create-namespace \
+		--timeout 5m \
+		--set watchNamespace=$(NAMESPACE) \
+		--wait \
+		--atomic || \
+	(echo "$(RED)Failed to install KEDA. Cleaning up...$(NC)" && \
+	$(HELM) uninstall keda --namespace keda 2>/dev/null && \
+	$(KUBECTL) delete namespace keda --wait=false && \
+	exit 1)
+	
+	@echo "$(GREEN)Verifying KEDA installation...$(NC)"
+	@for i in {1..60}; do \
+		if $(KUBECTL) get crd scaledobjects.keda.sh -o jsonpath='{.metadata.name}' >/dev/null 2>&1; then \
+			echo "$(GREEN)KEDA CRDs are ready!$(NC)"; \
+			break; \
+		fi; \
+		if [ $$i -eq 60 ]; then \
+			echo "$(RED)Timeout waiting for KEDA CRDs$(NC)"; \
+			exit 1; \
+		fi; \
+		echo "$(YELLOW)Waiting for KEDA CRDs... Attempt $$i/60$(NC)"; \
+		sleep 5; \
+	done
+
+	@echo "$(GREEN)Cleaning up any existing APISIX installation...$(NC)"
+	@-$(HELM) uninstall apisix-ingress --namespace $(NAMESPACE) 2>/dev/null || true
+	@sleep 5  # Give time for cleanup
+
+	@echo "$(GREEN)Installing APISIX operator and CRDs...$(NC)"
 	@$(HELM) repo add apisix https://charts.apiseven.com
 	@$(HELM) repo update
-	@$(HELM) install apisix apisix/apisix --namespace $(NAMESPACE) --create-namespace
+	@$(HELM) install apisix-ingress apisix/apisix-ingress-controller \
+		--namespace $(NAMESPACE) \
+		--create-namespace \
+		--set image.tag=3.0.0 \
+		--set config.apisix.serviceNamespace=$(NAMESPACE)
+
+	@echo "$(GREEN)Waiting for APISIX CRDs to be ready...$(NC)"
+	@for i in {1..30}; do \
+		if $(KUBECTL) get crd apisixroutes.apisix.apache.org >/dev/null 2>&1; then \
+			echo "$(GREEN)APISIX CRDs are ready!$(NC)"; \
+			break; \
+		fi; \
+		if [ $$i -eq 30 ]; then \
+			echo "$(RED)Timeout waiting for APISIX CRDs$(NC)"; \
+			exit 1; \
+		fi; \
+		echo "$(YELLOW)Waiting for APISIX CRDs... Attempt $$i/30$(NC)"; \
+		sleep 5; \
+	done
 	
 	@echo "$(GREEN)Operators installed successfully!$(NC)"
 
@@ -116,7 +170,7 @@ deploy-db: create-namespace ## Deploy YugabyteDB
 .PHONY: deploy-opa
 deploy-opa: create-namespace ## Deploy Open Policy Agent
 	@echo "$(GREEN)Deploying Open Policy Agent...$(NC)"
-	@$(KUBECTL) apply -f kubernetes/opa.yaml
+	@$(KUBECTL) apply -f kubernetes/policies/opa.yaml
 	@echo "$(GREEN)Open Policy Agent deployed successfully!$(NC)"
 
 .PHONY: deploy-services
@@ -134,20 +188,59 @@ deploy-services: create-namespace ## Deploy microservices
 
 .PHONY: deploy-keda
 deploy-keda: create-namespace ## Deploy KEDA scalers
-	@echo "$(GREEN)Deploying KEDA scalers...$(NC)"
+	@echo "$(GREEN)Checking KEDA installation...$(NC)"
+	@if ! $(KUBECTL) get crd scaledobjects.keda.sh -o jsonpath='{.metadata.name}' >/dev/null 2>&1; then \
+		echo "$(RED)KEDA CRDs not found. Please run 'make install-operators' first$(NC)"; \
+		exit 1; \
+	fi
+	@echo "$(GREEN)KEDA CRDs verified, deploying scalers...$(NC)"
 	@$(KUBECTL) apply -f kubernetes/keda-scaler.yaml
 	@echo "$(GREEN)KEDA scalers deployed successfully!$(NC)"
 
 .PHONY: deploy-apisix
 deploy-apisix: create-namespace ## Deploy APISIX gateway
+	@echo "$(GREEN)Checking APISIX CRDs...$(NC)"
+	@if ! $(KUBECTL) get crd apisixroutes.apisix.apache.org >/dev/null 2>&1; then \
+		echo "$(RED)APISIX CRDs not found. Please run 'make install-operators' first$(NC)"; \
+		exit 1; \
+	fi
 	@echo "$(GREEN)Deploying APISIX gateway...$(NC)"
 	@$(KUBECTL) apply -f kubernetes/apisix-deployment.yaml
-	@$(KUBECTL) apply -f kubernetes/apisix.yaml
+	@$(KUBECTL) apply -f kubernetes/apisix.yaml || true
 	@echo "$(GREEN)APISIX gateway deployed successfully!$(NC)"
 
+.PHONY: deploy-observability
+deploy-observability: create-namespace ## Deploy observability stack
+	@echo "$(GREEN)Deploying OpenTelemetry Collector...$(NC)"
+	@$(KUBECTL) apply -f kubernetes/observability.yaml
+	
+	@echo "$(GREEN)Deploying Jaeger...$(NC)"
+	@$(HELM) repo add jaegertracing https://jaegertracing.github.io/helm-charts
+	@$(HELM) repo update
+	@$(HELM) install jaeger jaegertracing/jaeger \
+		--namespace $(NAMESPACE) \
+		--set collector.service.otlp.grpc.name=jaeger-collector \
+		--set collector.service.otlp.grpc.port=14250
+	
+	@echo "$(GREEN)Deploying Prometheus...$(NC)"
+	@$(HELM) repo add prometheus-community https://prometheus-community.github.io/helm-charts
+	@$(HELM) repo update
+	@$(HELM) install prometheus prometheus-community/prometheus \
+		--namespace $(NAMESPACE) \
+		--set server.persistentVolume.enabled=false
+	
+	@echo "$(GREEN)Observability stack deployed successfully!$(NC)"
+
+.PHONY: deploy-redis
+deploy-redis: create-namespace ## Deploy Redis and transaction workers
+	@echo "$(GREEN)Deploying Redis...$(NC)"
+	@$(KUBECTL) apply -f kubernetes/observability.yaml
+	@echo "$(GREEN)Redis and transaction workers deployed successfully!$(NC)"
+
 .PHONY: deploy-all
-deploy-all: deploy-db deploy-opa deploy-services deploy-keda deploy-apisix ## Deploy all components
+deploy-all: deploy-db deploy-opa deploy-services deploy-keda deploy-apisix deploy-observability deploy-redis ## Deploy all components
 	@echo "$(GREEN)All components deployed successfully!$(NC)"
+	@echo "$(YELLOW)Run 'make port-forward' to access the services$(NC)"
 
 .PHONY: deploy-helm
 deploy-helm: ## Deploy using Helm chart
@@ -168,6 +261,10 @@ logs-user-service: ## View logs for User Service
 .PHONY: logs-transaction-service
 logs-transaction-service: ## View logs for Transaction Service
 	@$(KUBECTL) logs -f deployment/transaction-service -n $(NAMESPACE)
+
+.PHONY: logs-worker
+logs-worker: ## View logs for Transaction Worker
+	@$(KUBECTL) logs -f deployment/transaction-worker -n $(NAMESPACE)
 
 .PHONY: run-locally
 run-locally: ## Run services locally for development
